@@ -28,6 +28,8 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.data import RandomSampler, SequentialSampler
 from tqdm import tqdm, trange
+from fairseq.models.roberta import RobertaModel as FairseqRobertaModel
+
 
 from transformers import (
   BertConfig,
@@ -184,6 +186,7 @@ def extract_embeddings(args, text_file, tok_file, embed_file, lang='en', pool_ty
   all_embeds = [np.zeros(shape=(num_sents, args.embed_size), dtype=np.float32) for _ in range(num_embeds)]
   for i in tqdm(range(num_batch), desc='Batch'):
     start_index = i * batch_size
+    print(sent_toks[start_index], start_index)
     end_index = min((i + 1) * batch_size, num_sents)
     batch, pool_mask = prepare_batch(sent_toks[start_index: end_index], 
                                      tokenizer, 
@@ -196,6 +199,25 @@ def extract_embeddings(args, text_file, tok_file, embed_file, lang='en', pool_ty
 
     with torch.no_grad():
       outputs = model(**batch)
+#      from transformers import RobertaTokenizer
+#      from transformers.modeling_roberta import RobertaConfig, RobertaForMaskedLM, RobertaForSequenceClassification, RobertaModel
+#      input_ids =torch.tensor([batch["input_ids"][0].cpu().numpy()]).cpu()
+#      model = RobertaModel.from_pretrained(args.model_name_or_path)
+#      model.eval()
+#      outputs = model(input_ids=input_ids)
+#      print(outputs[0].shape)
+#      print(outputs[0])
+#      roberta = FairseqRobertaModel.from_pretrained(args.model_name_or_path)
+#      proj_1 = roberta.model.decoder.proj_1
+#      proj_2 = roberta.model.decoder.proj_2
+#      import torch.nn.functional as F
+#      print(proj_2(F.relu(proj_1(outputs[0][0]))).detach().numpy())
+#      roberta.eval()
+#      print("batch:", batch)
+#      print(batch['input_ids'][0])
+#      print("model:", outputs[0][0], outputs[0][0].shape)
+#      print(model.extract_features(input_ids))
+#      roberta.model(outputs[0][0])
 
       if args.model_type == 'bert' or args.model_type == 'xlmr':
         last_layer_outputs, first_token_outputs, all_layer_outputs = outputs
@@ -212,7 +234,9 @@ def extract_embeddings(args, text_file, tok_file, embed_file, lang='en', pool_ty
         all_batch_embeds.extend(mean_pool_embedding(all_layer_outputs, pool_mask))
 
     for embeds, batch_embeds in zip(all_embeds, all_batch_embeds):
-      embeds[start_index: end_index] = batch_embeds.cpu().numpy().astype(np.float32)
+#      print(start_index, end_index, batch_embeds.shape)  
+#      print(embeds[start_index: end_index].shape, embeds[start_index])
+      embeds[start_index: end_index, :] = batch_embeds.cpu().numpy().astype(np.float32)
     del last_layer_outputs, first_token_outputs, all_layer_outputs
     torch.cuda.empty_cache()
   
@@ -375,6 +399,8 @@ def main():
   parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
   parser.add_argument("--concate_layers", action="store_true", help="concate_layers")
   parser.add_argument("--specific_layer", type=int, default=7, help="use specific layer")
+  parser.add_argument("--enable_proj_head", action="store_true", help="enable proj head")
+
   args = parser.parse_args()
 
   logging.basicConfig(handlers=[logging.FileHandler(os.path.join(args.output_dir, args.log_file)), logging.StreamHandler()],
@@ -387,6 +413,15 @@ def main():
   device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
   args.n_gpu = torch.cuda.device_count()
   args.device = device
+
+  if args.enable_proj_head:
+      roberta = FairseqRobertaModel.from_pretrained(args.model_name_or_path)
+      print(roberta.model.decoder)
+      roberta.eval()
+      proj_head = roberta.model.decoder.projection_head
+#      proj_1 = roberta.model.decoder.proj_1
+#      proj_2 = roberta.model.decoder.proj_2
+
 
   # Setup logging
   logging.basicConfig(
@@ -411,6 +446,7 @@ def main():
         else:
           indices = list(range(num_layers))
 
+        print("indices:", indices)
         for idx in indices:
           suf = str(idx)
           cand2score_file = os.path.join(args.output_dir, '{}_{}.tsv'.format(args.candidate_prefix, suf))
@@ -421,9 +457,11 @@ def main():
             y = load_embeddings(f'{prefix}.{TL}.emb_{idx}.npy') 
             mine_bitext(x, y, f'{prefix}.{SL}.txt', f'{prefix}.{TL}.txt', cand2score_file, dist=args.dist, use_shift_embeds=args.use_shift_embeds)
           gold_file = f'{prefix}.gold'
+          print("gold file", gold_file)
           if os.path.exists(gold_file):
             predict_file = os.path.join(args.predict_dir, f'test-{SL}.tsv')
-            results = bucc_eval(cand2score_file, gold_file, f'{prefix}.{SL}.txt', f'{prefix}.{TL}.txt', f'{prefix}.{SL}.id', f'{prefix}.id', predict_file, threshold)
+            results = bucc_eval(cand2score_file, gold_file, f'{prefix}.{SL}.txt', f'{prefix}.{TL}.txt', f'{prefix}.{SL}.id', f'{prefix}.{TL}.id', predict_file, args.threshold)
+            print("results:", results)
             best_threshold = results['best-threshold']
             logger.info('--Candidates: {}'.format(cand2score_file))
             logger.info('index={} '.format(suf) + ' '.join('{}={:.4f}'.format(k,v) for k,v in results.items()))
@@ -441,20 +479,42 @@ def main():
 
     src_lang2 = args.src_language
     tgt_lang2 = args.tgt_language
-    src_text_file = os.path.join(args.data_dir, 'tatoeba.{}-eng.{}'.format(src_lang2, src_lang2))
-    tgt_text_file = os.path.join(args.data_dir, 'tatoeba.{}-eng.eng'.format(src_lang2))
-    src_tok_file = os.path.join(args.output_dir, 'tatoeba.{}-eng.tok.{}'.format(src_lang2, src_lang2))
-    tgt_tok_file = os.path.join(args.output_dir, 'tatoeba.{}-eng.tok.eng'.format(src_lang2))
+    src_text_file = os.path.join(args.data_dir, '{}-en.{}'.format(src_lang2, src_lang2))
+    tgt_text_file = os.path.join(args.data_dir, '{}-en.en'.format(src_lang2))
+    src_tok_file = os.path.join(args.output_dir, '{}-en.tok.{}'.format(src_lang2, src_lang2))
+    tgt_tok_file = os.path.join(args.output_dir, '{}-en.tok.en'.format(src_lang2))
     
-    all_src_embeds = extract_embeddings(args, src_text_file, src_tok_file, None, lang=src_lang2)
-    all_tgt_embeds = extract_embeddings(args, tgt_text_file, tgt_tok_file, None, lang=tgt_lang2)
-
+    all_src_embeds = extract_embeddings(args, src_text_file, src_tok_file, None, lang=src_lang2, pool_type="cls")
+    all_tgt_embeds = extract_embeddings(args, tgt_text_file, tgt_tok_file, None, lang=tgt_lang2, pool_type="cls")
+    import torch.nn.functional as F
     idx = list(range(1, len(all_src_embeds) + 1, 4))
     best_score = 0
     best_rep = None
     num_layers = len(all_src_embeds)
     for i in [args.specific_layer]:
       x, y = all_src_embeds[i], all_tgt_embeds[i]
+      if args.enable_proj_head:
+          x = proj_head(torch.tensor(x)).detach().numpy()
+          y = proj_head(torch.tensor(y)).detach().numpy()
+#          x = proj_2(F.relu(proj_1(torch.tensor(x)))).detach().numpy()
+#          y = proj_2(F.relu(proj_1(torch.tensor(y)))).detach().numpy()
+
+      state_1 = np.array(F.normalize(torch.tensor(x), dim=-1, eps=1e-9).data)#[:1000]
+      state_2 = np.array(F.normalize(torch.tensor(y), dim=-1, eps=1e-9).data)#[:1000]
+      logits = np.matmul(state_1, state_2.T) #/ 0.1
+ #     print(x.shape, y.shape)
+ #     print(x[:10])
+#      print(logits.shape)
+#      print(logits[:100, :100])
+      new_logits = logits.argsort()[:, ::-1][:, :10]
+      print(logits[200:300].argsort()[:, ::-1][:, :10])
+#      print(logits[300:400].argsort()[:, ::-1][:, :10])
+      res = 0
+      for i in range(len(new_logits)):
+          if new_logits[i][0] == i:
+              res += 1
+      print("---------------")        
+      print("acc:", res / len(new_logits))
       predictions = similarity_search(x, y, args.embed_size, normalize=(args.dist == 'cosine'))
       with open(os.path.join(args.output_dir, f'test_{src_lang2}_predictions.txt'), 'w') as fout:
         for p in predictions:
